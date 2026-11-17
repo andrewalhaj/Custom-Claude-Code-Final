@@ -2,7 +2,7 @@
 
 This document describes how the custom build is put together: memory, retrieval, the memory store, the guards and failure handling. It describes the design, not the rules for changing it; those are in [CONTRIBUTING.md](CONTRIBUTING.md). Where the build runs and how it is operated is in [OPERATIONS.md](OPERATIONS.md).
 
-**Status: a design, not yet built.** It is adapted from the Hermes build's architecture (`Custom-Hermes-Agent-Final`). Nothing in this repository implements it yet, and no number in it has been measured here. Sections 3, 4 and 6 carry that design over, because it does not depend on the agent. Sections 1, 2, 5 and 7 are rewritten for Claude Code. Each section is updated to say what was built as its code merges.
+**Status: a design, not yet built.** Nothing in this repository implements it yet, and no number in it has been measured here. Each section is updated to say what was built as its code merges.
 
 Facts about Claude Code itself are stated for **Claude Code 2.1.322**, read from its documentation on 2026-11-17. Re-check them before upgrading Claude Code. A statement marked **[unverified]** was not read from the documentation and is checked before any code relies on it.
 
@@ -26,21 +26,21 @@ The build extends Claude Code through its documented extension points and change
 | Memory tools | An MCP server, whose tools the agent can call.[5] | Stores a fact and searches memory on demand (sections 3–4) |
 | Guards | Hooks on `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and `Stop`.[1] | Force lookups and stop unsafe actions (section 5) |
 | Skills | Claude Code skills.[6] | Procedures the agent follows for recurring tasks. The build ships none at first; a skill is added, through a pull request, when a recurring task needs one. |
-| Instruction files | `CLAUDE.md`, loaded from the user's home, the project and its subdirectories.[2] | The agent's operating rules. The build's own instruction file is installed at user level and is not loaded from this repository (CONTRIBUTING.md section 9). |
+| Instruction files | `CLAUDE.md`, loaded from the user's home, the project and its subdirectories.[2] | The agent's operating rules. They are the user's own and not part of the build: Claude Code does not load a `CLAUDE.md` from a plugin, so a standing rule the build needs is shipped as a skill.[15] |
 
 Claude Code's own memory stays on. It is the instruction files above, and auto memory: a directory per project whose `MEMORY.md` is loaded at the start of each session, up to 200 lines or 25 KB.[2] They hold standing rules and preferences. Everything else lives in the memory store.
 
-The build runs on one machine, against one local memory store. Every stored row records the project it belongs to.
+Each install runs on one machine, against that machine's own local memory store. Nothing is shared between machines: another user installs the plugin on their own machine and gets a store of their own. Every stored row records the project it belongs to.
 
 **One package.** The hook scripts, the MCP server and the failure module (section 6.1) are one Python package in this repository. A hook is a command Claude Code runs as a new process for each event, with the event as JSON on its standard input; the MCP server is one long-running process per session.[1][5] They share nothing in memory. What they share goes through the memory store or a local state database on the machine (section 2).
 
-Whether the package is installed as a Claude Code plugin or as entries in the user's settings is not decided; OPERATIONS.md section 3 records the choice when it is made.
+**One plugin.** The package is installed as a Claude Code plugin at user scope, pinned to a commit. The hooks are the plugin's `hooks/hooks.json`, the MCP server is declared in the plugin, and skills live in its `skills/` folder.[15] Claude Code copies an installed plugin into its plugin cache and loads that copy, and the copy's directory changes with every version.[16] So nothing the build must keep is written there: state lives in the plugin's data directory (section 2). How the plugin is installed and updated is in OPERATIONS.md section 3.
 
 ## 2. Entry points
 
 - **Recall runs inside the prompt hook's deadline.** Claude Code cancels a `UserPromptSubmit` hook after 30 seconds by default, discards its output and sends the prompt on.[1] Recall therefore enforces its own deadline well below that (section 3.6). On failure it adds a "recall failed" note with its failure code instead of exiting with an error, because that is the only way the failure reaches the turn.
 - **Every hook gets the session and the directory.** The event carries `session_id`, `transcript_path`, `cwd` and `hook_event_name`, and for a tool event `tool_name` and `tool_input`.[1]
-- **The project key comes from the session's working directory.** It is the normalised URL of the `origin` remote of the repository that `cwd` is in, so it is the same on every machine. An absolute path is never used, because it differs between machines. A directory that is not a repository has no project, and neither has a repository whose `origin` is missing, a local path or a file URL.
+- **The project key comes from the session's working directory.** It is the normalised URL of the `origin` remote of the repository that `cwd` is in, so it stays the same when the repository is moved or cloned again. An absolute path is never used, because it changes when a checkout moves. A directory that is not a repository has no project, and neither has a repository whose `origin` is missing, a local path or a file URL.
 - **A hook that fails lets the action through, unless the build makes it block.** When a hook crashes, times out, exits with a code other than 0 or 2, or prints invalid output, Claude Code carries on with the action. Exit code 2 blocks on `PreToolUse`, `UserPromptSubmit` and `Stop`.[1] So every entry point goes through one boundary wrapper in the failure module. On an unexpected exception it records the failure, with its traceback in the log (section 6.1), then does what that entry point requires:
 
   | Entry point | Recorded as | Then |
@@ -54,11 +54,14 @@ Whether the package is installed as a Claude Code plugin or as entries in the us
   | `PostToolUse`, `SessionStart`, `SessionEnd`, `PreCompact` | `unhandled` | Exits non-zero. These events cannot block, so they record and never enforce. |
 
   This wrapper, and the job wrapper (section 6.1), are the only code allowed to catch everything (CONTRIBUTING.md rule C2).
-- **The wrapper's own deadline comes before Claude Code's.** A hook Claude Code cancels at its timeout renders no decision, so the call goes ahead.[1] Each enforcing guard therefore has a deadline of its own, shorter than the `timeout` set for it in the settings, and answers with a block when it passes. The hooks reference also describes an `onFailure: "block"` option for a hook; whether to rely on it as well is decided when the first guard is built. **[unverified]**
+- **The wrapper's own deadline comes before Claude Code's.** A hook Claude Code cancels at its timeout renders no decision, so the call goes ahead.[1] Each enforcing guard therefore has a deadline of its own, shorter than the `timeout` set for it in the plugin's hook configuration, and answers with a block when it passes.
+- **Claude Code can also block when a hook fails.** From 2.1.295 a command hook can set `onFailure: "block"`. The action is then blocked when the hook cannot start, exits with a code other than 0 or 2, times out or prints invalid output.[1] It covers the one case the wrapper cannot: the hook's interpreter failing to start. It has no effect on `Stop` hooks.[1] Whether the guards on `PreToolUse` and `UserPromptSubmit` set it as well as using the wrapper is decided when the first guard is built.
+- **A guard blocks through its JSON answer, not through exit code 2 alone.** For a plugin's `UserPromptSubmit` hook, and for any `Stop` hook, Claude Code treats exit code 2 with nothing on stdout and a stderr that says a file is missing as a non-blocking error.[1]
 - **A memory tool that fails is a tool error, never an empty result.** A failure the tool expects, such as a missed deadline or an unreachable store, is returned as an error that carries its code (CONTRIBUTING.md rule C3). No guard counts it as a lookup (section 5.3).
-- **Local state.** A hook process ends when it answers, so what a guard keeps between calls, such as its record of what a session has read, lives in a SQLite database under the build's state directory on the machine, keyed by `session_id`. Nothing is written into the package's own directory or into Claude Code's settings.
-- **Session end is too short to work in.** `SessionEnd` hooks share a 1.5-second budget.[1] The hook only queues the session's `transcript_path` in the local state database. The digest (section 3.3) is written from the queue, off the turn's path.
-- **Subagents run the hooks too.** Hooks from settings run inside subagents,[1] so the guards apply there. Whether recall and extraction should run for a subagent's prompt is an open question (section 5.6).
+- **Local state.** A hook process ends when it answers, so what a guard keeps between calls, such as its record of what a session has read, lives in a SQLite database in the plugin's data directory, keyed by `session_id`. That directory is `${CLAUDE_PLUGIN_DATA}`: Claude Code keeps it across plugin updates and deletes it when the plugin is uninstalled, unless the uninstall is told to keep the data.[15] Nothing is written into the plugin's installed directory or into Claude Code's settings.
+- **Session end is too short to work in.** `SessionEnd` hooks get 1.5 seconds by default, and a `timeout` set on a plugin's hook does not raise that budget.[1] The hook only queues the session's `transcript_path` in the local state database. The digest (section 3.3) is written from the queue, off the turn's path.
+- **The transcript's format is not a contract.** Claude Code's documentation calls the transcript's entry format internal and says it changes between versions.[17] The file is also written asynchronously and can lag the conversation.[1] The digest, and the routing request's read of the previous reply (section 3.5), both depend on it, so the code that reads a transcript is tested against a recorded one and re-checked on every Claude Code upgrade (OPERATIONS.md section 5).
+- **Subagents run the hooks too.** A plugin's hooks run inside subagents, as hooks from settings files do,[1] so the guards apply there. Whether recall and extraction should run for a subagent's prompt is an open question (section 5.6).
 - **Open: mirroring Claude Code's own memory.** Whether a write to auto memory or to a `CLAUDE.md` is mirrored into the store as a deliberate fact, and from which event, is not decided. **[unverified]**
 
 ## 3. Retrieval
@@ -106,8 +109,8 @@ The sessions store is built only after the eval set (section 3.8) shows it adds 
 ### 3.2 Embedding
 
 - **One model for every store.** Facts, chunks and queries are all embedded by `Qwen3-Embedding-4B` at its native 2,560 dimensions, so their vectors are comparable.
-- **One pinned build.** The model build is pinned by its digest and recorded with every vector (`embedding_model`), written `qwen3-embedding:4b@sha256:<digest>` from Ollama's list of local models. A machine whose build differs refuses to run recall (`embed.model_mismatch`). A vector from a different build is never stored. The store's build is the one its facts record, so an empty store records none until its first fact. The provider checks when it starts, and its embedder checks again before embedding until a check has passed, so a failed check refuses every embedding and a later pass recovers.
-- **Storage.** Vectors are stored as `halfvec(2560)` with an HNSW cosine index. At this size the half-precision type is required: an HNSW index supports `vector` only up to 2,000 dimensions and `halfvec` up to 4,000. Indexing `halfvec` needs pgvector 0.7.0 or later.[7]
+- **One pinned build.** The model build is pinned by its digest and recorded with every vector (`embedding_model`), written `qwen3-embedding:4b@sha256:<digest>` from Ollama's list of local models. An install whose embedding build differs from the one its store records refuses to run recall (`embed.model_mismatch`). A vector from a different build is never stored. The store's build is the one its facts record, so an empty store records none until its first fact. A failed check refuses every embedding, and a later pass recovers. Every hook is a new process (section 1), so where the check runs and what it costs inside the recall deadline are decided when the embedder is built.
+- **Storage.** Vectors are stored as `halfvec(2560)` with an HNSW cosine index. At this size the half-precision type is required: an HNSW index supports `vector` only up to 2,000 dimensions and `halfvec` up to 4,000. The `halfvec` type was added in pgvector 0.7.0.[7]
 - **Query instruction.** Queries are prefixed with the task instruction the model card recommends; documents are embedded without one.[8] It becomes the default only after the eval set shows the gain.
 - **What is embedded.** A fact is embedded once, when it is stored. Reference and session text is cut into chunks of about 800 characters. Each chunk is prefixed with its origin: the file and heading for a reference, the user's message for a session reply.
 - **Caching.** A query is embedded once per turn and reused by every store.
@@ -117,7 +120,7 @@ The sessions store is built only after the eval set (section 3.8) shows it adds 
 
 1. **Three entrances.**
    - The agent stores a fact on purpose, with the MCP server's `store_fact` tool, saying what it rests on.
-   - An extraction model reads the user's prompts and tool results (command output, file contents, documentation lookups) and proposes facts. It never reads the agent's own replies, because a wrong reply would otherwise be recalled later as a known fact. Which event starts it, and through which route the model is called, are decided when it is built. A call the provider refuses for the account is `extract.refused`; any other failure, or an answer that is not a list of facts, is `extract.error`.
+   - An extraction model reads the user's prompts and tool results (command output, file contents, documentation lookups) and proposes facts. It never reads the agent's own replies, because a wrong reply would otherwise be recalled later as a known fact. Which event starts it, and through which route the model is called, are decided when it is built. A call the model's provider refuses for the account is `extract.refused`; any other failure, or an answer that is not a list of facts, is `extract.error`.
    - A digest model writes a digest of each long session (section 3.6) from its queued transcript (section 2). A session keeps one live digest: a later one replaces the earlier one. It reads the redacted transcript, without system prompts, and answers with a summary and the work left open, stored as the summary followed by an "Open items:" list. Its basis is `assistant_inferred`, since the transcript holds the agent's replies (rule 6), and it is never compared with facts, so it supersedes only its own session's earlier digest. A refused call is `digest.refused`; any other failure is `digest.error`; a digest the judge did not keep is `digest.dropped`, which is not a failure.
 2. **Redaction before any model sees the text.** The prompt, the tool output and the session transcript are redacted before they reach the extraction, digest or judge model, and before anything is stored (CONTRIBUTING.md rule L4). If redaction fails, nothing is sent or stored (`redact.failed`).
 3. **A filter on each.**
@@ -202,7 +205,7 @@ These are configuration values, carried over as starting values. Change one thro
 | Recency weight | Set by the eval set |
 | Recalled-note budget | Set by the eval set |
 
-How much context one hook may add to a prompt is read from the hooks reference before the recalled-note budget is set. **[unverified]**
+A hook's `additionalContext` is capped at 10,000 characters. Past that, Claude Code saves the text to a file and gives the model the file's path with a preview of the first 2,000 characters.[1] The recalled-note budget is therefore set below 10,000 characters.
 
 ### 3.7 What leaves the machine
 
@@ -227,20 +230,20 @@ No ranking change ships without numbers from the eval set.
 - The rest of the eval set lives in this repository as data files, reviewed through pull requests like code. A question copied from a real miss is reworded so that it holds no deployment values (CONTRIBUTING.md section 3).
 - Reports give recall@5, MRR and an abstention score.
 - The eval set runs against its own throwaway Postgres, on the pinned embedding build. It never touches the live store (OPERATIONS.md section 2).
-- The runner replays the whole build: for each question it drives the write path over the question's chat history, asks the question through recall, and scores the notes. The Hermes build's runner does this for its own provider; how much of it is shared is decided when this build's runner is written.
+- The runner replays the whole build: for each question it drives the write path over the question's chat history, asks the question through recall, and scores the notes.
 
 ## 4. The memory store
 
-The memory store is Postgres with the `pgvector` extension. It holds the facts, the session chunks and the events, and runs the hybrid search inside SQL functions. It is the local `claude_mem` database that the pack this build replaces already uses. The build's tables live in a schema of their own, `memory`, beside that pack's tables, which this repository did not create and never alters (CONTRIBUTING.md rule C7). The existing facts are copied in once, at the cutover (OPERATIONS.md section 8).
+The memory store is Postgres with the `pgvector` extension. It holds the facts, the session chunks and the events, and runs the hybrid search inside SQL functions. It is the local `claude_mem` database that the pack this build replaces already uses; that has not been checked on the machine, and is confirmed there before the first migration is applied (OPERATIONS.md section 8). The build's tables live in a schema of their own, `memory`, beside that pack's tables, which this repository did not create and never alters (CONTRIBUTING.md rule C7). The existing facts are copied in once, at the cutover (OPERATIONS.md section 8).
 
 ### 4.1 Design rules
 
-1. **One meaning for each column.** What a row is, where it came from, which project and session it belongs to and which machine wrote it are columns, never tags or fields in a shared blob.
+1. **One meaning for each column.** What a row is, where it came from and which project and session it belongs to are columns, never tags or fields in a shared blob.
 2. **The lifecycle is in the database.** Each fact records when it was last verified and what superseded it. Search reads only live rows, so a stale fact cannot look like a current one.
 3. **Nothing is hard-deleted by the agent.** A fact is superseded, with a pointer to its replacement, or retired, with a reason. The row stays.
 4. **Every vector records the build that made it.** A change of embedding model is a visible migration, not a silent mismatch.
 5. **Nothing unused.** No column, index or function argument exists without code that reads it.
-6. **Any machine can write a session chunk.** A chunk is identified by its source, session, the message's id and its chunk number, never by a row id or a position. Rows carry Claude Code's `session_id`. Still open: when Claude Code changes a session's id (a resume, a compaction, a clear), and which stable id a message in the transcript carries. Both are read from the documentation and a transcript before the sessions store is built. **[unverified]**
+6. **A session chunk is identified by what it is.** A chunk is identified by its session, the message's id and its chunk number, never by a row id or a position, so writing it twice changes nothing. Rows carry Claude Code's `session_id`. `/clear` ends the session and starts a new one, and `/branch` and `--fork-session` give the copy an ID of its own; `--resume` and `--continue` keep the original ID.[4][17] Still open: whether compaction changes the ID, and which stable id a message in the transcript carries. The transcript's format is internal to Claude Code (section 2), so both are read from a recorded transcript before the sessions store is built. **[unverified]**
 
 ### 4.2 Schema
 
@@ -258,7 +261,6 @@ create table memory.facts (
   origin           text not null check (origin in ('explicit', 'extracted', 'digest', 'imported')),
   basis            text not null check (basis in ('user_stated', 'tool_observed', 'assistant_inferred')),
   project          text,                     -- project key (section 2); null when the session had none
-  source           text not null,            -- the machine that wrote the row
   session_id       text,
   source_turn      integer,                  -- the session's user-turn number the fact came from
   embedding        halfvec(2560) not null,
@@ -287,7 +289,6 @@ alter table memory.facts add constraint facts_one_live_digest_per_session
 
 create table memory.transcript_chunks (
   id               uuid primary key default gen_random_uuid(),
-  source           text not null,            -- the machine that wrote the session
   project          text,
   session_id       text not null,
   message_uid      text not null,           -- the message's stable id (open: section 4.1)
@@ -297,7 +298,7 @@ create table memory.transcript_chunks (
   embedding_model  text not null,
   search_text      tsvector generated always as (to_tsvector('english', body)) stored,
   created_at       timestamptz not null default now(),
-  unique (source, session_id, message_uid, chunk_no)
+  unique (session_id, message_uid, chunk_no)
 );
 
 create index transcript_chunks_embedding_idx on memory.transcript_chunks using hnsw (embedding halfvec_cosine_ops);
@@ -307,7 +308,6 @@ create index transcript_chunks_created_at_idx on memory.transcript_chunks (creat
 create table memory.events (
   id          bigint generated always as identity primary key,
   at          timestamptz not null default now(),
-  source      text not null,                 -- the machine
   project     text,
   session_id  text,
   turn        integer,
@@ -326,21 +326,19 @@ create index events_code_idx on memory.events (code, at);
 | `kind` | A single fact, or a digest of a session |
 | `origin` | Who wrote it: stored on purpose, extracted, written by the digest job, or imported |
 | `basis` | What it rests on: the user said it, a tool showed it, or the agent inferred it |
-| `project`, `source` | The project it belongs to, and the machine that wrote it |
+| `project` | The project it belongs to |
 | `last_verified_at` | When the fact was last checked against the live system |
 | `superseded_by` | The fact that replaced this one. Empty on a live row. |
 | `retired_at`, `retired_reason` | Set together when a fact is withdrawn without a replacement |
 | `embedding_model` | The model and build that produced the vector |
 | `events.result` | `ok`, `empty` (searched, found nothing), `failed`, or `degraded` (a fallback or a retry succeeded) |
 
-The `source` column is carried over from the Hermes design. With one machine it is constant, so whether it stays is decided when the first migration is written (rule 5 above).
-
 Two SQL functions do the searching: one for facts and one for session chunks, which arrives with their table. Each runs the vector and full-text searches and fuses them. The facts search reads live rows only; session chunks have no lifecycle, so their search reads every chunk.
 
 ### 4.3 Access and migrations
 
 - **The build connects with a role that cannot delete.** That role can read, insert into the tables code writes to, and update only the columns that take updates. It cannot delete rows or create, alter or drop anything. The privileges belong to two group roles that the migrations create and that cannot log in: `memory_agent`, which the build's login role joins, and `memory_maintenance`, which only the retention job's login joins. Login roles and their passwords are created outside the repository (OPERATIONS.md section 3).
-- **Row Level Security is on for every table, as a backstop.** With RLS on and no policy, Postgres denies every row to a role that does not own the table, so each machine's role gets an explicit select policy on every table, insert policies on the tables code writes to, update policies only on tables that take updates, and no delete policy.[13]
+- **Row Level Security is on for every table, as a backstop.** With RLS on and no policy, Postgres denies every row to a role that does not own the table, so the build's role gets an explicit select policy on every table, insert policies on the tables code writes to, update policies only on tables that take updates, and no delete policy.[13]
 - **Schema changes are migration files in this repository**, reviewed through a pull request. Migrations only move forward; an applied migration is never edited. The store records the number of the newest migration applied in a one-row table, and the build carries the number it was built against; the startup check compares the two (section 5.5).
 - **Data this repository did not create is not ours to change** (CONTRIBUTING.md rule C7). An export exists before any migration touches data.
 - **Retention.** `events` rows and session chunks are deleted after 90 days by a scheduled job on the machine that connects with the maintenance role, so the role the agent's session uses can never delete. Each run records `job.succeeded` naming `retention`; a missing one is reported as `job.missed` by the job-health check (OPERATIONS.md section 4). Facts and digests are kept.
@@ -362,7 +360,9 @@ A rule in a prompt only asks. The model can skip a lookup that a prompt requests
 
 All four are as the hooks reference describes them.[1]
 
-**The reply cannot be withheld.** The Hermes build holds a reply back until its guard has run. Claude Code's `Stop` hook runs after the reply has been shown; blocking it continues the conversation, it does not take the reply back. So here the user can see an unchecked reply, followed by the model being sent back and a corrected one. The guard's notice says the first reply was not checked.
+**A `Stop` guard cannot take a reply back.** Claude Code's `Stop` hook runs after the reply has been shown; blocking it continues the conversation, it does not withdraw the reply. So the user can see an unchecked reply, followed by the model being sent back and a corrected one. The guard's notice says the first reply was not checked. Claude Code also ends the turn itself after stop hooks have continued it eight times in a row.[1]
+
+Claude Code has a `MessageDisplay` hook as well, which can replace the text shown on screen as a reply streams, but not what is stored in the transcript or sent to the model.[1] Whether a guard uses it to hold back the display of an unchecked reply is open.
 
 ### 5.3 The guards
 
@@ -376,7 +376,7 @@ All four are as the hooks reference describes them.[1]
 What counts as a checkable question, a question about past work, a managed file or setting, a lookup tool and a sensitive action is defined in each guard's configuration file in this repository, as patterns and lists. Changing one is a pull request like any code change, with the guard's tests updated. The first lists are written when each guard is built, from an inventory of what the current setup guards; none is fixed here.
 
 - **A lookup counts only from `PostToolUse`**, which fires for a call that succeeded, including calls inside a batch.
-- **The write gate asks through Claude Code's own permission prompt**, by answering `ask` from `PreToolUse`. A hook's `ask` or `deny` still applies in `bypassPermissions` mode.[3] What happens to an `ask` when nobody can answer, in a run started with `-p`, is not stated on the pages read; the setting `permissions.denyInsteadOfPrompting` exists for it. The gate's behaviour there is tested before it is relied on. **[unverified]**
+- **The write gate asks through Claude Code's own permission prompt**, by answering `ask` from `PreToolUse`. A hook's `deny` blocks the call in every permission mode, `bypassPermissions` included.[18] Whether a hook's `ask` still prompts in that mode is not stated on the pages read **[unverified]**; OPERATIONS.md section 3 forbids the mode. In a run started with `-p` with nobody to answer, Claude Code denies a call that would prompt, and the model reads the hook's reason in the tool result.[1] The setting `permissions.denyInsteadOfPrompting` does the same for every run.[3] The gate's behaviour there is still tested before it is relied on (CONTRIBUTING.md rule C6).
 - **Each event names what was matched and no more:** the listed path, or the program and verb a command pattern matched. The rest of a command is not stored, because an argument can be a credential that no redactor knows.
 
 ### 5.4 How a guard is built
@@ -392,10 +392,9 @@ What counts as a checkable question, a question about past work, a managed file 
 
 - **Claude Code fails open, so the build fails closed itself.** A hook that crashes, times out or prints invalid output does not stop the action.[1] Every enforcing guard goes through the boundary wrapper (section 2), which records `guard.crash` and answers with a block, and keeps its own deadline below the hook's timeout.
 - **Nothing can refuse to start a session.** `SessionStart` has no blocking or decision control.[1] The startup check therefore runs there to record and to warn: it adds a notice to the session's context and writes its failure code. It checks that:
-  - the build's settings are present and valid (`config.missing`): the machine's name and the store's connection string;
-  - Claude Code's settings have the values the build depends on (`config.unsafe`): every guard's hook is registered, and `disableAllHooks` is not set;
-  - the store is at the migration the build was built against, or a later one (`db.behind`);
-  - the machine's name is the name of the login the store sees.
+  - the build's settings are present and valid (`config.missing`), the store's connection string among them;
+  - Claude Code's settings have the values the build depends on (`config.unsafe`): every guard's hook is registered in the plugin's hook configuration, and `disableAllHooks` is not set;
+  - the store is at the migration the build was built against, or a later one (`db.behind`).
 - **A missing setting blocks the prompt.** The `UserPromptSubmit` hook checks the build's settings on every prompt. When one is missing or invalid, it blocks the prompt with a notice that names the setting (`config.missing`), so the agent never runs a turn with the build half configured.
 - **Each guard finishes fast.** Each keeps its whole run, network calls included, under 10 seconds, and writes its events off the answer's path, so a store that stops answering cannot hold a tool call open.
 
@@ -404,7 +403,7 @@ What counts as a checkable question, a question about past work, a managed file 
 - Detection is by pattern. A question phrased outside the patterns gets no reminder, no wider search and no open-items answer.
 - A lookup check proves that a lookup happened, not that it was the right one.
 - A reply is shown before the `Stop` guard runs (section 5.2).
-- **Hooks can be switched off, and then no guard runs and nothing records it.** The setting `disableAllHooks`, a managed `allowManagedHooksOnly`, and a session started with `--bare`, which skips hooks, MCP servers and `CLAUDE.md`, each do this.[1][4] Such a session writes no events, and nothing catches it yet. Whether it can be recorded after the fact, as the Hermes build's `guard.bypassed` is, is open.
+- **Hooks can be switched off, and then no guard runs and nothing records it.** The setting `disableAllHooks`, a managed `allowManagedHooksOnly` that does not force-enable the plugin, disabling or uninstalling the plugin, and a session started with `--bare` or `--safe-mode`, which skip hooks, plugins and MCP servers, each do this.[1][4] Such a session writes no events, and nothing catches it yet. A `ConfigChange` hook sees a settings file change during a session and can block it,[1] but it does not see a session that starts with the hooks already off. Whether such a session can be recorded after the fact is open.
 - A deny rule or a command pattern matches the command text. The same program called in another form, or a script that writes a file through its own code, is not seen.[3]
 - Hooks run inside subagents.[1] Whether the fact gate and the recall gate should arm on a subagent's prompt, and how a subagent's lookups count for its parent's turn, is decided when those guards are built. Any exemption is written down here, because an exempt path produces unguarded claims.
 - A person's earlier "always allow" answer covers later calls the same rule matches, and the write gate does not see the answer itself. **[unverified]**
@@ -437,12 +436,11 @@ Starting codes, carried over. A code is added to the module with the code that e
 | `digest.error` | The digest model failed or answered something other than a digest |
 | `digest.refused` | The digest model's provider refused the account: logged out, billing, or forbidden |
 | `digest.dropped` | Not a failure: a session's digest was not stored, because the judge did not keep it or a later or concurrent digest of the session is live |
-| `guard.bypassed` | A session was found to have run with the hooks off. Whether this can be detected after the fact is open (section 5.6) |
 | `guard.crash`, `guard.not_loaded` | A guard raised during a turn (recorded instead of `unhandled`), or the startup check found a guard's hook not registered |
 | `write_gate.would_ask`, `write_gate.would_block` | Not failures: in `log` mode, the write gate saw a call on its list that `on` would send to a person for approval, or would block outright (section 5.3) |
-| `verify_gate.would_block`, `verify_gate.would_withhold` | Not failures: in `log` mode, a call would change a listed file or setting the session never read, or a reply stated a listed file's contents the session never read (section 5.3) |
-| `fact_gate.armed`, `fact_gate.would_withhold`, `fact_gate.passed` | Not failures: in `log` mode, the user asked a checkable question; its reply had no lookup, or gave a procedure or diagnosis with no documentation lookup; or its reply came with the lookups asked for (section 5.3) |
-| `recall_gate.armed`, `recall_gate.would_withhold`, `recall_gate.passed` | Not failures: in `log` mode, the user asked about past work or open work; the reply came without both the memory search and the session search; or it came with both (section 5.3) |
+| `verify_gate.would_block` | Not a failure: in `log` mode, a call would change a listed file or setting the session never read (section 5.3) |
+| `fact_gate.armed`, `fact_gate.would_block`, `fact_gate.passed` | Not failures: in `log` mode, the user asked a checkable question; the stop would have been blocked, because the reply had no lookup, or gave a procedure or diagnosis with no documentation lookup; or its reply came with the lookups asked for (section 5.3) |
+| `recall_gate.armed`, `recall_gate.would_block`, `recall_gate.passed` | Not failures: in `log` mode, the user asked about past work or open work; the stop would have been blocked, because the reply came without a memory search; or it came with one (section 5.3) |
 | `config.unsafe` | The startup check found a Claude Code setting with a value the build does not support (section 5.5) |
 | `config.missing` | A setting the build needs is missing or invalid: the startup check warns, a scheduled job stops, and every prompt is blocked (section 5.5) |
 | `redact.failed` | The redactor raised; the text is not stored or sent |
@@ -470,7 +468,7 @@ Some failures raise nothing. A daily check flags any scheduled job with no `job.
 
 Claude Code does not own logging for the build. A hook is a separate process whose stdout and stderr Claude Code reads as the hook's answer, and an MCP server speaks its protocol over stdout.[1][5] So the build logs to a file of its own:
 
-- **One rotating log file per machine**, in the build's state directory, set up by one function in the failure module.
+- **One rotating log file per machine**, in the plugin's data directory (section 2), set up by one function in the failure module.
 - **Redaction.** Every line passes through the build's redactor, and so does every value before it is written to the store or sent off the machine. The redactor's patterns are the build's own, with a test for each key format it must catch.
 - **Structure.** Each event is one line whose message is a single JSON object, written by one helper in the failure module that both logs the line and writes the `events` row, so the two always use the same fields.
 - **Durability.** Logs rotate and live on one machine. Decisions and failures also go to `events`, which outlives the log.
@@ -487,7 +485,7 @@ The rules are L1–L5 in CONTRIBUTING.md.
 - [4] [CLI reference (Claude Code documentation)](https://code.claude.com/docs/en/cli-reference)
 - [5] [Connect Claude Code to tools via MCP (Claude Code documentation)](https://code.claude.com/docs/en/mcp)
 - [6] [Extend Claude with skills (Claude Code documentation)](https://code.claude.com/docs/en/skills)
-- [7] [HNSW indexes (Supabase Docs)](https://supabase.com/docs/guides/ai/vector-indexes/hnsw-indexes)
+- [7] [pgvector README: HNSW and the dimensions each type can index; changelog for 0.7.0](https://github.com/pgvector/pgvector)
 - [8] [Qwen3-Embedding-4B model card (Hugging Face)](https://huggingface.co/Qwen/Qwen3-Embedding-4B)
 - [9] [Park et al., Generative Agents: Interactive Simulacra of Human Behavior, arXiv 2304.03442](https://arxiv.org/abs/2304.03442)
 - [10] [pgvector README: filtering and iterative index scans](https://github.com/pgvector/pgvector)
@@ -495,3 +493,7 @@ The rules are L1–L5 in CONTRIBUTING.md.
 - [12] [Wu et al., LongMemEval, arXiv 2410.10813](https://arxiv.org/abs/2410.10813)
 - [13] [Row security policies (PostgreSQL documentation)](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)
 - [14] [xiaowu0162/longmemeval-cleaned (Hugging Face dataset card)](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)
+- [15] [Plugins reference (Claude Code documentation)](https://code.claude.com/docs/en/plugins-reference)
+- [16] [How plugins load: the cache, versions and updates (Claude Code documentation)](https://code.claude.com/docs/en/plugins/loading)
+- [17] [Sessions: resuming, branching and where transcripts are stored (Claude Code documentation)](https://code.claude.com/docs/en/sessions)
+- [18] [Hooks guide (Claude Code documentation)](https://code.claude.com/docs/en/hooks-guide)
